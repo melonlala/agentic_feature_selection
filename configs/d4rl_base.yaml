@@ -1,0 +1,53 @@
+env:
+  env_id: null           # overridden per task
+  task_type: "continuous"  # "discrete" for Taxi, "continuous" for D4RL
+  obs_dim: null          # overridden per task
+  action_dim: null       # overridden per task
+  # Indices considered "oracle" (task-relevant) features; overridden per task
+  oracle_feature_indices: []
+
+dataset:
+  # D4RL datasets are loaded from HDF5; no env stepping needed
+  source: "d4rl_hdf5"      # "env_rollout" for Taxi, "d4rl_hdf5" for D4RL
+  hdf5_path: null          # auto-resolved from env_id if null
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  max_samples: null        # cap total samples (null = use all)
+  deduplicate: false
+
+shap:
+  background_size: 200
+  explain_size: 500
+  target: "chosen_action_prob"
+  nsamples: "auto"
+  imputer: "marginal"
+
+mci:
+  # For continuous actions, target must be "action_multi" or "action_norm"
+  target: "action_multi"   # multi-output ridge over all action dimensions
+  rff_dim: 64
+  bandwidth: 1.0
+  lambda_: 0.001
+  n_perms: 200
+  max_samples: 3000
+
+student:
+  # Continuous BC hypers; task-specific configs may override
+  hidden_dims: [256, 256]
+  lr: 0.001
+  epochs: 100
+  batch_size: 256
+  task_type: "continuous"  # triggers bc_continuous_model + MSE loss
+  topk_list: [5, 10, 20, 30, 45]  # overridden per task
+  # Cap training rows for large datasets to keep per-run time reasonable.
+  # Set null to use all rows; 30000 is sufficient for stable BC on D4RL.
+  max_train_samples: 30000
+
+eval:
+  online_episodes: 50
+  offline_batch_size: 512
+
+logging:
+  save_csv: true
+  save_json: true

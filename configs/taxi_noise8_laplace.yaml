@@ -1,0 +1,5 @@
+env:
+  noise_dim: 8
+  noise_type: "laplace"
+  noise_params:
+    scale: 1.0

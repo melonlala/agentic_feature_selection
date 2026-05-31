@@ -1,0 +1,98 @@
+# seals/Ant-v1 (continuous control, IRL pipeline)
+# obs_dim = 29, action_dim = 8
+# Used by the AIRL pipeline in scripts/run_ant_irl.sh and scripts/run_ant_latent_irl.sh
+env:
+  env_id: "seals/Ant-v1"
+  task_type: "continuous"
+  obs_dim: 29
+  action_dim: 8
+  # No principled oracle: the Ant proprioceptive state has no clear
+  # task-vs-distractor split (every dim is geometric/dynamical).
+  oracle_feature_indices: []
+
+dataset:
+  source: "expert_rollout"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  # Number of expert episodes to collect when running collect_ant_expert_data.py.
+  min_expert_episodes: 60
+  n_envs: 8
+
+teacher:
+  # Used by the full-feature BC student that powers SAGE/SHAP explanation.
+  bc_epochs: 80
+  bc_lr: 1e-3
+  bc_weight_decay: 1e-4
+  bc_batch_size: 256
+  bc_hidden_dims: [64, 64]
+  n_envs: 8
+  rollout_min_episodes: 60
+  eval_episodes: 20
+
+student:
+  # Used when training subset BC students for SAGE/SHAP explanation models.
+  hidden_dims: [64, 64]
+  lr: 1e-3
+  epochs: 60
+  batch_size: 256
+  task_type: "continuous"
+  topk_list: [4, 8, 16, 24, 29]
+  latent_topk_list: [4, 8, 16, 32, 64]
+  max_train_samples: 8000
+
+# AIRL / IRL hyperparameters (consumed by student/train_student_irl.py).
+irl:
+  algo: "airl"                # one of {airl, gail}
+  total_timesteps: 200000     # PPO updates inside the AIRL/GAIL loop
+  n_envs: 8
+  ppo_n_steps: 1024
+  ppo_batch_size: 256
+  ppo_n_epochs: 5
+  ppo_ent_coef: 0.0
+  ppo_lr: 3e-4
+  ppo_gamma: 0.99
+  ppo_gae_lambda: 0.95
+  ppo_clip_range: 0.2
+  demo_batch_size: 1024
+  gen_replay_buffer_capacity: 2048
+  n_disc_updates_per_round: 4
+  reward_hidden: [64, 64]
+
+# Offline preference-comparisons dataset (consumed by
+# teacher/collect_ant_preferences.py). Pure-expert configuration: every episode
+# in the pool comes from the PPO expert, and only preferences_expert.pkl is
+# written. Preferences stay informative because expert episode returns still
+# vary widely (see source_summaries.return_std in metadata.json).
+preferences:
+  # Each seals/Ant-v1 episode is 1000 steps, so 250 episodes ≈ 250k transitions.
+  # That comfortably exceeds the 2*num_pairs*fragment_length = 200k transitions
+  # the fragmenter consumes, so fragments are sampled with little/no reuse.
+  total_episodes: 250     # trajectories rolled out into the pool (all expert)
+  expert_frac: 1.0        # fraction of episodes from the PPO expert
+  noisy_frac: 0.0         # fraction from a noisy expert (expert + Gaussian noise)
+  random_frac: 0.0        # fraction from a uniform-random policy
+  noise_std: 0.5          # std of Gaussian noise (unused while noisy_frac=0)
+  fragment_length: 50     # timesteps per fragment
+  num_pairs: 2000         # number of comparisons (fragment pairs)
+  discount_factor: 0.99   # discount used for each fragment's return label
+  max_size: null          # cap on stored comparisons (FIFO); null = unbounded
+  # Labels are stored as (return_a, return_b) — the discounted return of each
+  # fragment — rather than a binary preference. Derive a preference downstream
+  # via sigmoid((return_a - return_b) / T) at any temperature T.
+
+mci:
+  target: "action_multi"
+  rff_dim: 64
+  bandwidth: 1.0
+  lambda_: 0.001
+  n_perms: 200
+  max_samples: 3000
+
+eval:
+  online_episodes: 20
+  offline_batch_size: 512
+
+logging:
+  save_csv: true
+  save_json: true

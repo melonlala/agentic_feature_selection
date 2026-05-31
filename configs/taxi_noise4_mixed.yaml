@@ -1,0 +1,18 @@
+# Four noise types simultaneously, 1 feature each (total noise_dim=4).
+# Feature names: z_gaussian_0, z_bernoulli_0, z_correlated_0, z_state_correlated_0
+env:
+  noise_dim: 4
+  noise_type: "mixed"
+  noise_params:
+    components:
+      - type: gaussian
+        dim: 1
+      - type: bernoulli
+        dim: 1
+        p: 0.5
+      - type: correlated
+        dim: 1
+        correlation_strength: 0.0
+      - type: state_correlated
+        dim: 1
+        state_correlation_strength: 0.5

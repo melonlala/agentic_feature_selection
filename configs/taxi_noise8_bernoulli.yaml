@@ -1,0 +1,5 @@
+env:
+  noise_dim: 8
+  noise_type: "bernoulli"
+  noise_params:
+    p: 0.5

@@ -1,0 +1,38 @@
+# pen-human-v1 from D4RL (Adroit hand, human demonstrations)
+# obs_dim = 45: [0:24] hand joint pos, [24:27] obj pos, [27:30] obj euler,
+#               [30:33] target pos, [33:36] target euler,
+#               [36:39] obj-target pos delta, [39:42] obj-target rot delta,
+#               [42:45] contact features
+# action_dim = 24: hand joint velocities (torques)
+env:
+  env_id: "pen-human-v1"
+  task_type: "continuous"
+  obs_dim: 45
+  action_dim: 24
+  # Oracle: hand joint positions — sufficient to reproduce manipulation behaviour
+  oracle_feature_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                            14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+
+dataset:
+  source: "d4rl_hdf5"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+
+student:
+  hidden_dims: [256, 256]
+  lr: 0.001
+  epochs: 100
+  batch_size: 256
+  task_type: "continuous"
+  topk_list: [5, 10, 15, 20, 30, 45]
+  latent_topk_list: [5, 10, 20, 40, 80, 160, 256]
+  max_train_samples: 30000
+
+mci:
+  target: "action_multi"
+  rff_dim: 64
+  bandwidth: 1.0
+  lambda_: 0.001
+  n_perms: 200
+  max_samples: 3000

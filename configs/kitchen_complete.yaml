@@ -1,0 +1,35 @@
+# kitchen-complete-v2 from D4RL
+# obs_dim = 60: [0:9] robot joint pos, [9:18] robot joint vel, [18:60] object/goal state
+# action_dim = 9: end-effector velocity deltas + gripper
+env:
+  env_id: "kitchen-complete-v2"
+  task_type: "continuous"
+  obs_dim: 60
+  action_dim: 9
+  # Oracle: robot proprioception (joints + velocities) — task-controllable without scene info
+  oracle_feature_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+
+dataset:
+  source: "d4rl_hdf5"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+
+student:
+  hidden_dims: [256, 256]
+  lr: 0.001
+  epochs: 100
+  batch_size: 256
+  task_type: "continuous"
+  topk_list: [5, 10, 20, 30, 45, 60]
+  # Used by latent-space pipeline (hidden_dims[0] = 256 candidate units)
+  latent_topk_list: [5, 10, 20, 40, 80, 160, 256]
+  max_train_samples: 30000
+
+mci:
+  target: "action_multi"
+  rff_dim: 64
+  bandwidth: 1.0
+  lambda_: 0.001
+  n_perms: 200
+  max_samples: 3000

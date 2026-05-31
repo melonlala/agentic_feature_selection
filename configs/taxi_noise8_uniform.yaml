@@ -1,0 +1,6 @@
+env:
+  noise_dim: 8
+  noise_type: "uniform"
+  noise_params:
+    low: 0.0
+    high: 1.0

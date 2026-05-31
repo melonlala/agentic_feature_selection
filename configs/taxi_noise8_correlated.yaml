@@ -1,0 +1,5 @@
+env:
+  noise_dim: 8
+  noise_type: "correlated"
+  noise_params:
+    correlation_strength: 0.8

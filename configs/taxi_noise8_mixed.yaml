@@ -1,0 +1,20 @@
+# Four noise types simultaneously, 2 features each (total noise_dim=8).
+# Feature names will be:
+#   z_gaussian_0/1, z_bernoulli_0/1, z_correlated_0/1, z_state_correlated_0/1
+# This lets SHAP comparisons reveal which noise family is hardest to dismiss.
+env:
+  noise_dim: 8
+  noise_type: "mixed"
+  noise_params:
+    components:
+      - type: gaussian
+        dim: 2
+      - type: bernoulli
+        dim: 2
+        p: 0.5
+      - type: correlated
+        dim: 2
+        correlation_strength: 0.8
+      - type: state_correlated
+        dim: 2
+        state_correlation_strength: 0.5

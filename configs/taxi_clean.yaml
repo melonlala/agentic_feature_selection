@@ -1,0 +1,11 @@
+env:
+  noise_dim: 0
+
+# Override teacher hyperparameters for native Taxi-v3 (Discrete obs, one-hot encoded).
+# Converges much faster than continuous float encoding — 200k steps is sufficient.
+teacher:
+  total_timesteps: 200000
+  learning_starts: 1000
+  exploration_fraction: 0.5
+  target_update_interval: 100
+  net_arch: [256, 256]

@@ -1,0 +1,38 @@
+# kitchen-complete-v2 from D4RL — tuned config for full-feature online performance.
+#
+# Differences vs configs/kitchen_complete.yaml:
+#   - use_gaussian_policy: true  — Gaussian head with NLL loss instead of MSE;
+#     handles multi-modal kitchen demos that cause mode-collapse under MSE.
+#   - max_train_samples: null    — use all 109k training rows (was 30k cap).
+#   - epochs: 200                — give Gaussian policy time to converge.
+env:
+  env_id: "kitchen-complete-v2"
+  task_type: "continuous"
+  obs_dim: 60
+  action_dim: 9
+  oracle_feature_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+
+dataset:
+  source: "d4rl_hdf5"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+
+student:
+  hidden_dims: [256, 256]
+  lr: 0.001
+  epochs: 200
+  batch_size: 256
+  task_type: "continuous"
+  use_gaussian_policy: true
+  topk_list: [5, 10, 20, 30, 45, 60]
+  latent_topk_list: [5, 10, 20, 40, 80, 160, 256]
+  max_train_samples: null
+
+mci:
+  target: "action_multi"
+  rff_dim: 64
+  bandwidth: 1.0
+  lambda_: 0.001
+  n_perms: 200
+  max_samples: 3000

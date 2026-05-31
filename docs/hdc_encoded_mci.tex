@@ -1,0 +1,134 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{Feature-wise Hyperdimensional Encoding with Regression-based MCI for Data Explanation}
+\author{Yuchen}
+\date{April 2026}
+
+\begin{document}
+
+\maketitle
+
+
+
+
+\section{Feature-wise HDC Encoding}
+
+Given input $x = (x_1, \dots, x_d)$, we encode each feature independently:
+
+\begin{equation}
+z_j(x_j) = \sqrt{\frac{2}{D_j}} \cos(W_j x_j + b_j)
+\end{equation}
+
+The full representation is:
+
+\begin{equation}
+z(x) = [z_1(x_1), \dots, z_d(x_d)]
+\end{equation}
+
+Feature-wise HDC encoder may help with calculating $w_S^*$ in \ref{eq:regression_solution} efficiently. 
+
+\section{Regression Model}
+
+We use ridge regression:
+
+\begin{equation}
+\hat{y} = w^\top z(x)
+\end{equation}
+
+For a subset $S \subseteq \{1,\dots,d\}$:
+
+\begin{equation}
+z_S(x) = [z_j(x_j)]_{j \in S}
+\end{equation}
+
+\begin{equation}
+w_S^* = \arg\min_w \sum_{n=1}^N (y_n - w^\top z_S(x_n))^2 + \lambda \|w\|^2
+\end{equation}
+
+Closed-form solution:
+
+\begin{equation}
+w_S^* = (Z_S^\top Z_S + \lambda I)^{-1} Z_S^\top y
+\label{eq:regression_solution}
+\end{equation}
+
+We don't need to retrain the optimal model given subset $S$ anymore. 
+
+\section{Predictive Power Estimation}
+
+We define predictive power of features in subset $S$ as:
+
+\begin{equation}
+\nu(S) = \mathrm{Var}(y) - \mathrm{MSE}(S)
+\end{equation}
+
+where:
+
+\begin{equation}
+\mathrm{MSE}(S) = \frac{1}{N} \sum_{n=1}^N (y_n - \hat{y}_n^{(S)})^2
+\end{equation}
+
+\section{Marginal Contribution Importance (MCI)}
+
+MCI is approximated as:
+
+\begin{equation}
+\widehat{I}(i) = \max_{S \subseteq F \setminus \{i\}} \left[\nu(S \cup \{i\}) - \nu(S)\right]
+\end{equation}
+
+
+We highlight a key property of marginal contribution importance (MCI): it provides an upper bound on predictive power.
+
+
+For any subset of features $S \subseteq F$, let $\nu(S)$ denote predictive power and define normalized MCI as:
+\begin{equation}
+\tilde I(i) = \frac{I_\nu(i)}{\nu(F)}.
+\end{equation}
+
+Then for any subset $S \subseteq F$, we have:
+\begin{equation}
+\frac{\nu(S)}{\nu(F)} \le \sum_{i \in S} \tilde I(i).
+\end{equation}
+
+The left-hand side represents the fraction of total predictive power explained by $S$, 
+while the right-hand side provides an upper bound based on the maximal marginal contributions 
+of individual features. 
+
+
+% In practice, we estimate this via sampled permutations:
+
+% \begin{equation}
+% \widehat{I}(i) = \max_{\sigma} \left[\nu(S_i^\sigma \cup \{i\}) - \nu(S_i^\sigma)\right]
+% \end{equation}
+
+\section{Computational Advantages}
+
+The feature-wise structure enables:
+
+\begin{itemize}
+    \item Block-wise design matrices $Z_S$
+    \item Efficient ridge updates
+    \item Avoidance of full retraining
+\end{itemize}
+
+\section{Discussion}
+
+Our framework provides:
+
+\begin{itemize}
+    \item Nonlinear modeling via RFF
+    \item Feature modularity via HDC
+    \item Efficient MCI approximation via regression
+\end{itemize}
+
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
