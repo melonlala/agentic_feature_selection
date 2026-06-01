@@ -1,0 +1,13 @@
+# Fixed parameters for ranker/mci_rank_kernel.py (config-only, no CLI flags).
+#
+# These configure the FeatureWiseHDCEncoder (RFF encoding) and the closed-form
+# ridge solve that defines nu(S), the permutation sampling used for MCI, and the
+# fragment pairing for the pc evaluator.
+mci_kernel:
+  rff_dim: 64          # Random Fourier Feature dims per input feature (D_j).
+  bandwidth: 1.0       # RFF bandwidth (std of frequency dist); kernel length-scale.
+  lambda_: 0.001       # Ridge regularisation strength lambda.
+  n_perms: 200         # Random feature permutations for MCI approximation.
+  max_samples: 3000    # Cap training rows before MCI (0 = use full dataset).
+  fragment_length: 50  # pc-only: length of each contiguous trajectory fragment.
+  num_pairs: 50        # pc-only: number of fragment pairs to compare for nu(S).

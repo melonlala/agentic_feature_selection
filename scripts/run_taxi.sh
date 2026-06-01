@@ -117,7 +117,7 @@ echo ""
 echo "MCI pipeline done."
 echo ""
 echo "To train selector students using MCI ranking:"
-echo "  python student/train_student.py \\"
+echo "  python student/train_student_discrete.py \\"
 echo "      --config $CONFIG --seed 0 \\"
 echo "      --dataset_path outputs/datasets/taxi_noise8/seed0/dataset.npz \\"
 echo "      --selector shap \\"
@@ -141,7 +141,7 @@ SEEDS=(0 1 2 3 4)
 # --- Train full students first (SHAP is run on the student, not teacher) ---
 for SEED in "${SEEDS[@]}"; do
     echo "===== Training full student seed=$SEED ====="
-    python student/train_student.py \
+    python student/train_student_discrete.py \
         --config "$CONFIG" \
         --seed "$SEED" \
         --dataset_path "outputs/datasets/taxi_noise8/seed${SEED}/dataset.npz" \
@@ -199,7 +199,7 @@ for SEED in "${SEEDS[@]}"; do
             RANKING_ARG="--ranking_path outputs/rankings/taxi_noise8/seed${SEED}/ranking.csv"
         fi
 
-        python student/train_student.py \
+        python student/train_student_discrete.py \
             --config "$CONFIG" \
             --seed "$SEED" \
             --dataset_path "outputs/datasets/taxi_noise8/seed${SEED}/dataset.npz" \
@@ -224,3 +224,34 @@ for SEED in "${SEEDS[@]}"; do
 done
 
 echo "All students trained and evaluated."
+
+
+#!/usr/bin/env bash
+# Full end-to-end pipeline (modified v2 order):
+#   1. Train clean teachers (no noise)
+#   2. Collect noisy datasets
+#   3. Train full students + run SHAP on student + global ranking
+#   4. Train selector students + evaluate
+#   5. Plot
+# Run from the sverl_feature_distill/ directory.
+
+set -euo pipefail
+
+echo "========================================="
+echo " SVERL Feature Distillation — Full Pipeline"
+echo "========================================="
+
+bash scripts/run_teachers.sh
+bash scripts/run_collect.sh
+bash scripts/run_shap.sh
+bash scripts/run_students.sh
+
+echo "===== Generating plots ====="
+python eval/make_plots.py \
+    --input_root outputs \
+    --output_dir outputs/plots
+
+echo "========================================="
+echo " Pipeline complete. Results in outputs/"
+echo "========================================="
+

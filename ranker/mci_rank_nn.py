@@ -358,19 +358,91 @@ def load_dataset(dataset_path: str) -> Tuple[MultiVariateArray, UniVariateArray,
     feature_names = data["feature_names"] if "feature_names" in data else [f"feature_{i}" for i in range(X.shape[1])]
     return X, Y, feature_names
 
+def _box_space(dim: int, low: float = -np.inf, high: float = np.inf):
+    """Build a 1-D gymnasium Box space of the given dimensionality."""
+    import gymnasium as gym
+
+    return gym.spaces.Box(low=low, high=high, shape=(int(dim),), dtype=np.float32)
+
+
 def create_evaluator(X, Y, feature_names, evaluator_name: str, evaluator_params: dict) -> EvaluationFunction:
+    # Behavior cloning (imitation.algorithms.bc) as the per-subset evaluator.
+    # For a feature subset S we train a BC policy that only observes columns S
+    # (the demonstrations are rebuilt with the reduced-dimensional obs), then
+    # score it by how well its deterministic actions match the expert actions.
+    # nu(S) is that prediction accuracy: exact-match for discrete actions, R^2
+    # (coefficient of determination) for continuous actions.
+    #
+    # Optional `evaluator_params`:
+    #   rng          : np.random.Generator (defaults to seed 0).
+    #   bc_kwargs    : extra kwargs passed to bc.BC (e.g. batch_size, policy).
+    #   train_kwargs : kwargs passed to BC.train (default {"n_epochs": 5}).
     if evaluator_name == "bc":
         from imitation.algorithms import bc
-        from imitation.data import rollout
-        from imitation.util import util
+        from imitation.data.types import Transitions
 
-        model = bc.BC(
-            observation_space=util.space_from_box(X.shape[1:]),
-            action_space=util.space_from_box(Y.shape[1:]),
-            **evaluator_params,
+        params = dict(evaluator_params or {})
+        rng = params.get("rng") or np.random.default_rng(0)
+        bc_kwargs = params.get("bc_kwargs", {})
+        train_kwargs = params.get("train_kwargs", {"n_epochs": 5})
+
+        acts_full = np.asarray(Y, dtype=np.float32)
+        action_space = _box_space(acts_full.shape[1], low=-1.0, high=1.0)
+
+        # Discrete-action detection: single integer-valued column with small
+        # cardinality -> use exact-match classification accuracy; otherwise the
+        # actions are continuous and we report R^2.
+        discrete = (
+            acts_full.shape[1] == 1
+            and np.allclose(acts_full, np.round(acts_full))
+            and len(np.unique(acts_full)) <= 50
         )
 
-        return model
+        def evaluator(x, y=None, x_test=None, y_test=None):
+            """nu(S): BC prediction accuracy for feature subset S.
+
+            Train a BC policy that only observes columns S of the observations,
+            then score its deterministic action predictions against the expert
+            actions (exact-match accuracy for discrete actions, R^2 for
+            continuous). Higher = better, so MCI gains are positive when a
+            feature helps the policy reproduce the expert.
+            """
+            obs = np.asarray(x, dtype=np.float32)
+            n = obs.shape[0]
+            transitions = Transitions(
+                obs=obs,
+                acts=acts_full,
+                infos=np.array([{}] * n),
+                next_obs=obs,  # unused by BC; placeholder to satisfy Transitions
+                dones=np.zeros(n, dtype=bool),
+            )
+
+            trainer = bc.BC(
+                observation_space=_box_space(obs.shape[1]),
+                action_space=action_space,
+                demonstrations=transitions,
+                rng=rng,
+                **bc_kwargs,
+            )
+            trainer.train(**train_kwargs)
+
+            eval_obs = np.asarray(x_test, dtype=np.float32) if x_test is not None else obs
+            eval_acts = (
+                np.asarray(y_test, dtype=np.float32) if y_test is not None else acts_full
+            )
+            pred_acts, _ = trainer.policy.predict(eval_obs, deterministic=True)
+            pred_acts = np.asarray(pred_acts, dtype=np.float32).reshape(eval_acts.shape)
+
+            if discrete:
+                return float(
+                    (np.round(pred_acts) == np.round(eval_acts)).all(axis=1).mean()
+                )
+            # Continuous actions: R^2 coefficient of determination (1.0 = perfect).
+            ss_res = float(np.sum((eval_acts - pred_acts) ** 2))
+            ss_tot = float(np.sum((eval_acts - eval_acts.mean(axis=0)) ** 2)) + 1e-12
+            return 1.0 - ss_res / ss_tot
+
+        return evaluator
 
     # Max Causal Entropy IRL (imitation.algorithms.mce_irl) as the per-subset
     # predictive-power evaluator. Follows the imitation MCE-IRL example:
@@ -403,7 +475,6 @@ def create_evaluator(X, Y, feature_names, evaluator_name: str, evaluator_params:
         from imitation.data import rollout
         from imitation.rewards import reward_nets
         from seals import base_envs
-        from stable_baselines3.common.vec_env import DummyVecEnv
 
         params = dict(evaluator_params or {})
         env_creator = params["env_creator"]
@@ -453,36 +524,165 @@ def create_evaluator(X, Y, feature_names, evaluator_name: str, evaluator_params:
                 initial_state_dist=full_env.initial_state_dist,
             )
 
-        # The feature subset S is carried by the column names of X.
-        columns = [name_to_col[name] for name in X.columns]
-        sub_env = _subset_env(columns)
+        train_kwargs = params.get("train_kwargs", {})
 
-        reward_net = reward_nets.BasicRewardNet(
-            sub_env.observation_space,
-            sub_env.action_space,
-            use_action=False,
-            use_done=False,
-            use_next_state=False,
-            **reward_net_kwargs,
-        )
+        def _state_visitation_kl(expert, learned):
+            """KL(expert || learned) between state-visitation distributions.
 
-        mce_irl = MCEIRL(
-            expert_om,
-            sub_env,
-            reward_net,
-            rng=rng,
-            discount=discount,
-            **mceirl_kwargs,
-        )
-        
-        return mce_irl
+            `expert`/`learned` are MCE occupancy measures (expected per-state visit
+            counts); normalise each to a probability distribution before comparing.
+            """
+            p = np.asarray(expert, dtype=np.float64)
+            q = np.asarray(learned, dtype=np.float64)
+            p = p / p.sum()
+            q = q / q.sum()
+            eps = 1e-12
+            mask = p > eps
+            return float(np.sum(p[mask] * np.log(p[mask] / (q[mask] + eps))))
+
+        def evaluator(x, y=None, x_test=None, y_test=None):
+            """nu(S): predictive power of feature subset S (its column names in x).
+
+            Trains MCEIRL with a reward net that only observes columns S, then
+            scores the recovered policy by how close its state-visitation
+            distribution is to the expert's — i.e. the negative state-visitation
+            KL (docs/experiment.md 4.2; higher = better, so MCI gains are positive
+            when a feature helps).
+            """
+            columns = [name_to_col[name] for name in x.columns]
+            sub_env = _subset_env(columns)
+
+            reward_net = reward_nets.BasicRewardNet(
+                sub_env.observation_space,
+                sub_env.action_space,
+                use_action=False,
+                use_done=False,
+                use_next_state=False,
+                **reward_net_kwargs,
+            )
+
+            mce_irl = MCEIRL(
+                expert_om,
+                sub_env,
+                reward_net,
+                rng=rng,
+                discount=discount,
+                **mceirl_kwargs,
+            )
+            # train() returns the recovered policy's state-occupancy measure.
+            learned_om = mce_irl.train(**train_kwargs)
+            return -_state_visitation_kl(expert_om, learned_om)
+
+        return evaluator
+
+    # Preference learning (imitation.algorithms.preference_comparisons) as the
+    # per-subset evaluator. X / Y already hold the pre-collected trajectory
+    # transitions, so we build static fragments from them (no AgentTrainer /
+    # rollout generation). For a feature subset S the reward net only observes
+    # columns S, while the synthetic preference labels stay fixed (they come from
+    # ground-truth returns). nu(S) is the preference-prediction accuracy of the
+    # trained reward model (docs/experiment.md 4.3).
+    #
+    # Required `evaluator_params`:
+    #   rews  : (N,) per-transition ground-truth rewards (for labels + fragments).
+    #   dones : (N,) per-transition episode-termination flags (episode splitting).
+    # Optional `evaluator_params`:
+    #   rng              : np.random.Generator (defaults to seed 0).
+    #   fragment_length  : RandomFragmenter fragment length (default 50).
+    #   num_pairs        : number of fragment pairs to compare (default 50).
+    #   reward_epochs    : BasicRewardTrainer epochs per fit (default 10).
+    elif evaluator_name == "pc":
+        import torch as th
+        from imitation.algorithms import preference_comparisons
+        from imitation.data.types import TrajectoryWithRew
+        from imitation.rewards.reward_nets import BasicRewardNet
+        from imitation.util.networks import RunningNorm
+
+        params = dict(evaluator_params or {})
+        rng = params.get("rng") or np.random.default_rng(0)
+        fragment_length = params.get("fragment_length", 50)
+        num_pairs = params.get("num_pairs", 50)
+        reward_epochs = params.get("reward_epochs", 10)
+
+        # Episode structure + rewards are subset-independent; capture them once.
+        acts_full = np.asarray(Y, dtype=np.float32)
+        rews = np.asarray(params["rews"], dtype=np.float32).reshape(-1)
+        dones = np.asarray(params["dones"]).reshape(-1).astype(bool)
+        action_space = _box_space(acts_full.shape[1], low=-1.0, high=1.0)
+
+        # Inclusive end index of each episode (close the final partial episode).
+        ep_ends = [i for i in range(len(rews)) if dones[i]]
+        if not ep_ends or ep_ends[-1] != len(rews) - 1:
+            ep_ends.append(len(rews) - 1)
+
+        fragmenter = preference_comparisons.RandomFragmenter(warning_threshold=0, rng=rng)
+        gatherer = preference_comparisons.SyntheticGatherer(rng=rng)
+
+        def _build_trajectories(obs):
+            """Split (obs, acts, rews) into imitation TrajectoryWithRew episodes."""
+            trajs = []
+            start = 0
+            for end in ep_ends:
+                sl = slice(start, end + 1)
+                ep_obs = obs[sl]
+                # imitation Trajectory requires len(obs) == len(acts) + 1; repeat
+                # the last observation as the (unused) terminal observation.
+                ep_obs = np.concatenate([ep_obs, ep_obs[-1:]], axis=0)
+                trajs.append(
+                    TrajectoryWithRew(
+                        obs=ep_obs,
+                        acts=acts_full[sl],
+                        infos=None,
+                        terminal=bool(dones[end]),
+                        rews=rews[sl],
+                    )
+                )
+                start = end + 1
+            return trajs
+
+        def evaluator(x, y=None, x_test=None, y_test=None):
+            """nu(S): preference-prediction accuracy for feature subset S.
+
+            The reward net only sees columns S of the observations; it is fit on
+            synthetic preferences (labelled by ground-truth returns) and scored by
+            the fraction of comparisons it ranks the same way as the labels.
+            """
+            obs = np.asarray(x, dtype=np.float32)
+            reward_net = BasicRewardNet(
+                _box_space(obs.shape[1]),
+                action_space,
+                normalize_input_layer=RunningNorm,
+            )
+            preference_model = preference_comparisons.PreferenceModel(reward_net)
+            reward_trainer = preference_comparisons.BasicRewardTrainer(
+                preference_model=preference_model,
+                loss=preference_comparisons.CrossEntropyRewardLoss(),
+                epochs=reward_epochs,
+                rng=rng,
+            )
+
+            trajectories = _build_trajectories(obs)
+            fragments = fragmenter(trajectories, fragment_length, num_pairs)
+            preferences = gatherer(fragments)
+
+            dataset = preference_comparisons.PreferenceDataset()
+            dataset.push(fragments, preferences)
+            reward_trainer.train(dataset)
+
+            # Accuracy as defined by CrossEntropyRewardLoss: both predicted and
+            # target preference probabilities thresholded at 0.5.
+            with th.no_grad():
+                probs, _ = preference_model(fragments)
+            predictions = probs.cpu().numpy() > 0.5
+            ground_truth = np.asarray(preferences) > 0.5
+            return float((predictions == ground_truth).mean())
+
+        return evaluator
 
     else:
         raise ValueError(
-            f"Unknown evaluator_name {evaluator_name!r}; expected 'bc' or 'irl'."
+            f"Unknown evaluator_name {evaluator_name!r}; expected 'bc', 'irl' or 'pc'."
         )
-
-    return evaluator
 
 def run(args):
     # preprocess data and create ranker
@@ -518,7 +718,27 @@ def run(args):
         "score_path": os.path.join(args.output_dir, "mci_values.json"), 
         "n_permutations": args.n_permutations,
         "ranker_name": "PermutationSampling",
-        "ranking_time": time.time(),
+        "ranking_time": ranking_time
     }
 
     save_json(metadata, os.path.join(args.output_dir, "metadata.json"))
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run MCI ranking on a dataset.")
+    parser.add_argument("--dataset_path", type=str, required=True, help="Path to the dataset (npz file with X, Y, feature_names).")
+    parser.add_argument("--evaluator_name", type=str, required=True, choices=["bc", "irl", "pc"], help="Name of the evaluator to use (bc, irl or pc).")
+    parser.add_argument("--evaluator_params", type=json.loads, default={}, help="JSON string of additional parameters for the evaluator.")
+    parser.add_argument("--n_permutations", type=int, default=1000, help="Number of permutations to sample for MCI estimation.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save outputs (plots and json files).")
+    parser.add_argument("--n_processes", type=int, default=1, help="Number of processes to use for parallel evaluation.")
+    parser.add_argument("--chunk_size", type=int, default=256, help="Chunk size for parallel evaluation.")
+    parser.add_argument("--max_context_size", type=int, default=100000, help="Max feature subset size to evaluate as context.")
+    parser.add_argument("--noise_confidence", type=float, default=0.05, help="PAC learning error bound confidence (delta).")
+    parser.add_argument("--noise_factor", type=float, default=0.1, help="Scalar to multiply by the PAC learning error bound.")
+    parser.add_argument("--track_all", action='store_true', help="Whether to save all observed contributions and not just max.")
+    parser.add_argument("--permutations_batch_size", type=int, default=200, help="Number of permutations to evaluate in each batch.")
+
+    args = parser.parse_args()
+    run(args)

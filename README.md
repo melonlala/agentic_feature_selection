@@ -300,7 +300,7 @@ MCI-NN and MCI-HDC do **not** need this step — they retrain fresh models
 per subset internally.
 
 ```bash
-python student/train_student.py \
+python student/train_student_discrete.py \
     --config configs/taxi_noise4.yaml \
     --seed 0 \
     --selector full \
@@ -359,7 +359,7 @@ python explain/mci_rank.py \
 ### 5. Train IL students with ranked features
 
 ```bash
-python student/train_student.py \
+python student/train_student_discrete.py \
     --config configs/taxi_noise4.yaml \
     --seed 0 \
     --selector shap \

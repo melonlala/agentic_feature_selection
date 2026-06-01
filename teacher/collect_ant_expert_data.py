@@ -1,32 +1,38 @@
-"""Collect seals/Ant-v1 expert demonstrations into a project-standard dataset.npz.
+"""Collect seals MuJoCo expert demonstrations into a project-standard dataset.npz.
+
+Works for any seals/* continuous-control env with a HumanCompatibleAI PPO expert
+on the HuggingFace Hub — verified for seals/Ant-v1, seals/Walker2d-v1 and
+seals/Hopper-v1. The env is read from ``env.env_id`` in the config (overridable
+with ``--env_id``), defaulting to seals/Ant-v1 for backwards compatibility.
 
 Mirrors teacher/load_d4rl_dataset.py's output schema so downstream ranking and
-training scripts (mci_rank.py, mci_rank_nn.py, sage_rank_continuous.py,
-shap_rank_continuous.py, train_student_continuous.py, train_student_irl.py)
-operate without modification.
+training scripts (ranker/mci_rank_nn.py, ranker/mci_rank_kernel.py,
+ranker/sage_rank.py, ranker/kernelshap.py, student/train_student.py) operate
+without modification — the (X, y, rewards, dones, next_X) keys support all three
+ranking tasks: bc (X→y), irl (X→rewards), pc (rewards + dones for fragments).
 
 Pipeline:
-  1. Build vectorized seals/Ant-v1 with RolloutInfoWrapper.
-  2. Load the HuggingFace PPO expert (HumanCompatibleAI / seals/Ant-v1).
+  1. Build the vectorized seals env with RolloutInfoWrapper.
+  2. Load the HuggingFace PPO expert (HumanCompatibleAI / <env_id>).
   3. Roll out the expert until ``min_expert_episodes`` are collected.
   4. Flatten trajectories into (obs, acts, next_obs, dones, rewards) tensors.
   5. Shuffle + 3-way split, write dataset.npz + metadata.
 
-Output schema (dataset.npz):
-    X_train / X_val / X_test          float32  [N, 29]
-    y_train / y_val / y_test          float32  [N, 8]
-    next_X_train / val / test         float32  [N, 29]
+Output schema (dataset.npz, dims shown for seals/Ant-v1):
+    X_train / X_val / X_test          float32  [N, obs_dim]
+    y_train / y_val / y_test          float32  [N, action_dim]
+    next_X_train / val / test         float32  [N, obs_dim]
     dones_train / val / test          bool     [N]
     rewards_train / val / test        float32  [N]
     action_norm_train / val / test    float32  [N]
-    feature_names                     str      [29]   obs_00 … obs_28
-    action_names                      str      [8]    act_0 … act_7
+    feature_names                     str      [obs_dim]      obs_00 …
+    action_names                      str      [action_dim]   act_0 …
 
 Usage:
     python teacher/collect_ant_expert_data.py \\
-        --config configs/seals_ant.yaml \\
+        --config configs/seals_walker.yaml \\
         --seed 0 \\
-        --output_dir outputs/datasets/seals_ant/seed0
+        --output_dir outputs/datasets/seals_walker/seed0
 """
 
 from __future__ import annotations
@@ -50,25 +56,26 @@ from utils.io import ensure_dir, save_json, save_npz
 from utils.seed import set_global_seed
 
 
-ENV_NAME = "seals/Ant-v1"
+DEFAULT_ENV = "seals/Ant-v1"
 
 
 def collect_expert_trajectories(
+    env_name: str,
     rng: np.random.Generator,
     n_envs: int,
     min_episodes: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Roll out the HuggingFace PPO expert and return flattened transitions.
+    """Roll out the HuggingFace PPO expert for `env_name` and return transitions.
 
     Returns:
-        obs       [N, 29] float32
-        acts      [N,  8] float32
-        next_obs  [N, 29] float32
-        dones     [N]     bool
-        rewards   [N]     float32
+        obs       [N, obs_dim]    float32
+        acts      [N, action_dim] float32
+        next_obs  [N, obs_dim]    float32
+        dones     [N]             bool
+        rewards   [N]             float32
     """
     env = make_vec_env(
-        ENV_NAME,
+        env_name,
         rng=rng,
         n_envs=n_envs,
         post_wrappers=[lambda e, _: RolloutInfoWrapper(e)],
@@ -76,7 +83,7 @@ def collect_expert_trajectories(
     expert = load_policy(
         "ppo-huggingface",
         organization="HumanCompatibleAI",
-        env_name=ENV_NAME,
+        env_name=env_name,
         venv=env,
     )
     rollouts = rollout.rollout(
@@ -126,22 +133,24 @@ def run(args: argparse.Namespace) -> None:
     out_dir = ensure_dir(args.output_dir)
     save_resolved_config(cfg, str(out_dir / "resolved_config.yaml"))
 
+    env_id = args.env_id or cfg.get("env", {}).get("env_id") or DEFAULT_ENV
+
     ds_cfg = cfg.get("dataset", {})
     n_envs       = int(ds_cfg.get("n_envs", 8))
     min_episodes = int(ds_cfg.get("min_expert_episodes", 60))
     train_ratio  = float(ds_cfg.get("train_ratio", 0.8))
     val_ratio    = float(ds_cfg.get("val_ratio",   0.1))
 
-    print(f"[collect_ant] env={ENV_NAME}, n_envs={n_envs}, "
+    print(f"[collect_seals] env={env_id}, n_envs={n_envs}, "
           f"min_episodes={min_episodes}, seed={args.seed}")
 
     obs, acts, next_obs, dones, rews = collect_expert_trajectories(
-        rng=rng, n_envs=n_envs, min_episodes=min_episodes,
+        env_name=env_id, rng=rng, n_envs=n_envs, min_episodes=min_episodes,
     )
     obs_dim    = int(obs.shape[1])
     action_dim = int(acts.shape[1])
     N = len(obs)
-    print(f"[collect_ant] Collected N={N}, obs_dim={obs_dim}, action_dim={action_dim}")
+    print(f"[collect_seals] Collected N={N}, obs_dim={obs_dim}, action_dim={action_dim}")
 
     # 3-way split — all arrays use the same random permutation.
     split = three_way_split(
@@ -166,12 +175,12 @@ def run(args: argparse.Namespace) -> None:
         feature_names=feature_names,
         action_names=action_names,
     )
-    print(f"[collect_ant] Saved dataset to {npz_path}")
+    print(f"[collect_seals] Saved dataset to {npz_path}")
     print(f"  train={len(split['X_train'])}, val={len(split['X_val'])}, "
           f"test={len(split['X_test'])}")
 
     save_json({
-        "env_id":         ENV_NAME,
+        "env_id":         env_id,
         "seed":           args.seed,
         "config":         args.config,
         "obs_dim":        obs_dim,
@@ -187,16 +196,19 @@ def run(args: argparse.Namespace) -> None:
         "task_type":      "continuous",
         "expert_source":  "ppo-huggingface/HumanCompatibleAI",
     }, str(out_dir / "metadata.json"))
-    print("[collect_ant] Done.")
+    print("[collect_seals] Done.")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Collect seals/Ant-v1 PPO-expert demos → dataset.npz."
+        description="Collect a seals/* PPO-expert dataset.npz (ant/walker/hopper/...)."
     )
     p.add_argument("--config",     required=True)
     p.add_argument("--seed",       type=int, default=0)
     p.add_argument("--output_dir", required=True)
+    p.add_argument("--env_id", default=None,
+                   help="seals/* env id; overrides env.env_id from config "
+                        "(default: seals/Ant-v1).")
     return p.parse_args()
 
 

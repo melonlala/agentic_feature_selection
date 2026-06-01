@@ -30,8 +30,8 @@ use the `il` conda env, launched from the repo root.
 | kernelShap | model padding (marginal imputation) | weighted coalition regression (SHAP `KernelExplainer`),  `nsamples = 2 * X.shape[1] + 2048` | `explain/kernelshap.py` | implemented |
 | mi | kNN entropy estimator | 3-nearest-neighbor mutual information (`mutual_info_*`, `n_neighbors=3`) | `utils/feature_utils.py` dispatch | **selector only — no `ranking.csv`** |
 | sage | model padding (`sage.MarginalImputer`) | permutation sampling (Shapley aggregation) | `explain/sage_rank.py` | implemented |
-| mci_nn | model retraining (per-subset `imitation.bc.BC`) | permutation sampling of random subsets | `explain/mci_rank_nn.py` | implemented |
-| mci_kernel | ridge regression on RFF/HDC encoding (closed form) | permutation sampling **(+ greedy local refinement — planned)** | `explain/mci_rank.py`, `explain/hdc_encoder.py` | **greedy refinement not yet coded** |
+| mci_nn | per-subset model **retraining**; ν(S) via `--evaluator_name {bc,irl,pc}` = BC action-accuracy / MCE-IRL −KL / preference accuracy | permutation sampling (prefix-chained; emits max + Shapley) | `ranker/mci_rank_nn.py` | implemented |
+| mci_kernel | closed-form **ridge** on RFF/HDC encoding; same `bc/irl/pc` ν(S) targets, no model training | permutation sampling (mirrors mci_nn; **+ greedy local refinement — planned**) | `ranker/mci_rank_kernel.py`, `ranker/hdc_encoder.py` | implemented (**greedy refinement not yet coded**) |
 
 **Method notes.**
 
@@ -51,16 +51,32 @@ use the `il` conda env, launched from the repo root.
   Natively global (no per-sample stage), much cheaper than SHAP. Knobs: `--n_permutations`
   (0 = auto-converge), `--convergence_thresh`, `--background_size`. Output column:
   `sage_value` (ranked by `|sage_value|`, aliased to `mean_mci`).
-- **mci_nn** — the faithful but expensive baseline: for each feature `i`, sample random
-  subsets `S ⊆ F\{i}`, retrain a BC policy (`imitation.bc.BC` over an SB3
-  `ActorCriticPolicy`) on `S` and on `S ∪ {i}`, and measure the marginal gain in
-  variance-explained. Knobs: `--n_perms`, `--aggregation {mean,max}`, `--epochs`,
-  `--hidden`, `--max_samples`. Output column: `mean_mci`.
+- **mci_nn** — the faithful but expensive baseline: subsets are explored by permutation
+  sampling and the per-subset predictive power `ν(S)` is obtained by *retraining* an
+  imitation model on `S` vs `S ∪ {i}`. The evaluator is chosen by `--evaluator_name`
+  (`ranker/mci_rank_nn.py::create_evaluator`): `bc` trains `imitation.bc.BC` over an SB3
+  `ActorCriticPolicy` and scores action-prediction accuracy (exact-match for discrete /
+  R² for continuous actions); `irl` runs MCE-IRL (`imitation.algorithms.mce_irl`) and
+  scores the **negative state-visitation KL** of the recovered vs. expert occupancy; `pc`
+  trains a preference reward net (`preference_comparisons.BasicRewardTrainer` +
+  `CrossEntropyRewardLoss`) and scores **preference-prediction accuracy**. Knobs:
+  `--n_perms`, `--evaluator_params` (per-evaluator training kwargs), `--max_samples`.
+  Output column: `mean_mci`.
 - **mci_kernel (MCI-HDC)** — replaces retraining with a closed-form ridge fit on a
-  Random-Fourier-Feature / HDC encoding of each feature (`explain/hdc_encoder.py`):
-  `ν(S) = Var(y) − MSE(S)` where `w_S = (Z_Sᵀ Z_S + λI)⁻¹ Z_Sᵀ y`. Subsets are explored by
-  permutation sampling; the planned **greedy local refinement** of the best subset per
-  feature is not yet implemented. Knobs: `--rff_dim`, `--bandwidth`, `--lambda_`,
+  Random-Fourier-Feature / HDC encoding of each feature (`ranker/hdc_encoder.py`):
+  `w_S = (Z_Sᵀ Z_S + λI)⁻¹ Z_Sᵀ t`. It mirrors the same three evaluators as mci_nn,
+  differing only in the **regression target** `t` and its scoring — `bc`: regress the
+  expert action matrix, score summed explained variance `Σⱼ[Var(yⱼ) − MSE_j(S)]`; `irl`:
+  regress per-transition reward, score its explained variance; `pc`: fit a ridge reward,
+  sum predicted reward over fragments, score preference-prediction accuracy over fragment
+  pairs. Subsets are explored by **permutation sampling that mirrors mci_nn** — `--n_perms`
+  random feature orderings, feature `p[i]`'s context is its prefix `p[:i]`, contribution
+  `ν(p[:i+1]) − ν(p[:i])`; prefix evaluations chain (each `ν(p[:i+1])` reused as the next
+  baseline) and a feature-set-keyed cache dedupes `ν(S)` across permutations (~2× fewer
+  ridge solves). Emits both the **max** contribution (`mci_scores` → `mean_mci`) and the
+  **mean** (`shapley_values`). The planned **greedy local refinement** is not yet coded.
+  Knobs: `--evaluator_name {bc,irl,pc}`, `--target` (bc action sub-target),
+  `--fragment_length`/`--num_pairs` (pc), `--rff_dim`, `--bandwidth`, `--lambda_`,
   `--n_perms`, `--max_samples`. Requires only the dataset (no student model). Output
   column: `mean_mci`.
 
@@ -82,7 +98,7 @@ Data source: `(state, action)` transitions in `dataset.npz`.
   oracle vector `[taxi_row, taxi_col, passenger_loc, destination]` (indices 0–3), with
   appended noise features `z_0 … z_{noise_dim-1}`. Schema: `X_{train,val,test}` `[N, D]`,
   `y_*` `[N]` action indices, `p_train` `[N, 6]` teacher softmax. Trained by
-  `student/train_student.py`.
+  `student/train_student_discrete.py`.
 - **Continuous — seals/Ant-v1 and D4RL kitchen/pen** (`student/train_bc_continuous.py`,
   loaded via `teacher/collect_ant_expert_data.py` / `teacher/load_d4rl_dataset.py`):
   `X` `[N, obs_dim]`, `y` `[N, action_dim]` continuous actions, plus `next_X`, `dones`,
@@ -143,25 +159,30 @@ state-correlated noise (plus mixed). D4RL HDF5 downloads are cached under
 ### 4.2 IRL — state-visitation KL *(NOT implemented — gap)*
 
 The plan calls for the KL distance between the state-visitation distribution of the target
-policy and the soft-optimal policy. **No such metric exists in the codebase.** Current IRL
-evaluation (`eval/eval_online_irl.py`) reports only `mean_return`, `std_return`,
-`success_rate`, `mean_length` from deterministic rollouts. The state-visitation KL must be
-built.
+policy and the soft-optimal policy. A state-visitation KL **now exists as the `irl`
+predictive-power evaluator** in `ranker/mci_rank_nn.py` (`_state_visitation_kl` over MCE
+occupancy measures, used as `ν(S)`), but **not yet as a downstream policy-evaluation
+metric**: current IRL evaluation (`eval/eval_online_irl.py`) reports only `mean_return`,
+`std_return`, `success_rate`, `mean_length` from deterministic rollouts. The downstream KL
+metric must still be built.
 
 ### 4.3 PL — preference-prediction accuracy *(NOT implemented — gap)*
 
-The plan calls for preference-prediction accuracy. **No preference model is trained or
-evaluated.** Today the repo only collects preference data and visualizes fragment-return
-distributions (`eval/plot_preference_scores.py`). A preference predictor trained on
-selected features and a held-out accuracy metric must be added.
+The plan calls for preference-prediction accuracy. Preference accuracy **now exists as the
+`pc` predictive-power evaluator** in both rankers (`ranker/mci_rank_nn.py` trains a reward
+net; `ranker/mci_rank_kernel.py` fits a ridge reward), used as `ν(S)`. But there is still
+**no standalone downstream preference predictor**: the repo otherwise only collects
+preference data and visualizes fragment-return distributions
+(`eval/plot_preference_scores.py`). A preference predictor trained on the selected top-`k`
+features with a held-out accuracy metric must still be added.
 
 ### 4.4 Implemented vs. gaps
 
 | setting | metric (plan) | status |
 | --- | --- | --- |
 | BC | action-prediction accuracy | implemented (offline + online) |
-| IRL | state-visitation KL (target vs. soft-optimal) | **gap** — only online return/success exist |
-| PL | preference-prediction accuracy | **gap** — only data collection + histograms exist |
+| IRL | state-visitation KL (target vs. soft-optimal) | **partial** — exists as the `irl` ranker ν(S); downstream policy-eval metric still a gap |
+| PL | preference-prediction accuracy | **partial** — exists as the `pc` ranker ν(S); standalone downstream predictor still a gap |
 
 ## 5. Pipeline & reproduction
 

@@ -1,0 +1,44 @@
+# seals/Hopper-v1 (continuous control)
+# obs_dim = 12, action_dim = 3
+# Dataset collected by teacher/collect_ant_expert_data.py (HuggingFace PPO expert).
+env:
+  env_id: "seals/Hopper-v1"
+  task_type: "continuous"
+  obs_dim: 12
+  action_dim: 3
+  # No principled oracle: every proprioceptive dim is geometric/dynamical.
+  oracle_feature_indices: []
+
+dataset:
+  source: "expert_rollout"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  min_expert_episodes: 60
+  n_envs: 8
+
+student:
+  hidden_dims: [64, 64]
+  lr: 1e-3
+  epochs: 60
+  batch_size: 256
+  task_type: "continuous"
+  topk_list: [2, 4, 6, 9, 12]
+  latent_topk_list: [4, 8, 16, 32, 64]
+  max_train_samples: 8000
+
+mci:
+  target: "action_multi"
+  rff_dim: 64
+  bandwidth: 1.0
+  lambda_: 0.001
+  n_perms: 200
+  max_samples: 3000
+
+eval:
+  online_episodes: 20
+  offline_batch_size: 512
+
+logging:
+  save_csv: true
+  save_json: true

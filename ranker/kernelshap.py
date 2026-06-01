@@ -1,90 +1,159 @@
-"""KernelSHAP feature ranking for a continuous predictor.
+"""KernelSHAP feature ranking for the bc / irl / pc tasks.
 
-Input:
-    - dataset.npz with X_train, X_val, feature_names
-    - model_ckpt: checkpoint (model.pt) of a full-feature fully_trained model. 
+KernelSHAP (Lundberg & Lee, 2017) attributes a single trained model's output to
+its input features by sampling feature coalitions and solving a weighted least
+squares. Unlike MCI (which *retrains* a model per feature subset), KernelSHAP
+trains **one** full-feature model and explains its predictions.
 
-Target:
-    For each sample x, the predicted vector f(x) ∈ R^{d_y}.
-    KernelSHAP attributes each feature's contribution to f. Local
-    attributions form a [K, d_y, d_x] array. Global ranking aggregates
-    over both samples and action dims:
-        score[j] = mean_{k, y} |SHAP_{k,y,j}|
+To stay comparable with the MCI rankers, the one trained model is exactly the
+per-task student of student/train_student.py — the *same model frame as MCI*:
 
+    bc  : imitation BC policy (SB3 ActorCriticPolicy). Output = action vector;
+          attribution aggregated over action dims.
+    irl : RewardMLP regressing ground-truth reward. Output = scalar reward.
+    pc  : RewardMLP trained by Bradley-Terry preference CE. Output = scalar
+          reward head.
+
+Global score: score[j] = mean over explained samples and output dims of
+|SHAP_{sample, out, j}|.
+
+Ranking time: the reported `ranking_time_sec` INCLUDES the one-time model
+training (model_training_time_sec) plus the KernelSHAP attribution
+(attribution_time_sec); they are also reported separately in metadata.
 
 Output (in --output_dir):
-    ranking.csv      — feature_index, feature_name, score, rank
-    kernelshap_values.npz  — kernelshap_values [d_y, K, d_x]  for downstream plotting
-    metadata.json — metadata about model_ckpt, dataset_path, and computation details
+    ranking.csv          — feature_index, feature_name, score, rank (rank 1 = top)
+    kernelshap_values.npz — shap_values [out, K, d]
+    metadata.json        — task, params, timing breakdown, test metrics
+    resolved_config.yaml
 
 Usage:
-    python explain/kernelshap.py \\
-        --model_ckpt outputs/seals_ant/model.pt \\
+    python ranker/kernelshap.py \\
+        --config       configs/seals_ant.yaml \\
+        --task         irl \\
         --dataset_path outputs/datasets/seals_ant/seed0/dataset.npz \\
-        --output_dir outputs/rankings_shap/seals_ant/seed0
+        --output_dir   outputs/rankings_kernelshap/seals_ant/seed0 \\
+        --seed 0
 """
 
-import shap
-import numpy as np
+from __future__ import annotations
+
 import argparse
-from pathlib import Path
-import json
-import torch
+import sys
 import time
+from pathlib import Path
+
+import numpy as np
+import shap
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from ranker.sage_rank import build_predict_fn  # shared task predict callable
+from student.train_student import load_task_dataset, train_and_eval_student
+from utils.io import save_json
+from utils.seed import set_global_seed
+
 
 def run(args: argparse.Namespace) -> None:
-    # prepare output directory and save config
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
+    set_global_seed(args.seed)
+    from student.train_bc_continuous import setup_run
+    cfg, device, out_dir = setup_run(args.config, args.seed, args.output_dir)
 
-    # prepare dataset and model
-    data = np.load(args.dataset_path)
-    X = data["X_train"]
-    y = data["y_train"]
-    feature_names = [str(f) for f in data.get("feature_names", [])]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = torch.load(args.model_ckpt, map_location=device)
+    data = load_task_dataset(args.dataset_path)
+    n_features = data["n_features"]
+    feature_names = data["feature_names"]
 
-    # use Kernel SHAP to explain dataset predictions
-    start_time = time.time()
-    explainer = shap.KernelExplainer(model.predict_proba, X, link="logit")
-    shap_values = explainer.shap_values(X)
+    # ── One-time model training (same frame as MCI) — timed ──
+    t0 = time.time()
+    full_idx = list(range(n_features))
+    model, test_metrics = train_and_eval_student(
+        args.task, data, full_idx, cfg, args.seed, device, args,
+    )
+    train_time = time.time() - t0
+    print(f"[kernelshap] trained {args.task} model on {n_features} features "
+          f"in {train_time:.1f}s; test={test_metrics}")
 
-    # aggregate SHAP values to get global feature importance scores
-    # (average over samples and action dimensions)
-    shap_values = np.array(shap_values)  # [d_y, K, d_x]
-    scores = np.mean(np.abs(shap_values), axis=(0, 1))  # save ranking
-    ranking = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
-    with open(out_dir / "ranking.csv", "w") as f:
-        f.write("feature_index,feature_name,score,rank\n")
-        for rank, (idx, score) in enumerate(ranking):
-            name = feature_names[idx] if idx < len(feature_names) else ""
-            f.write(f"{idx},{name},{score:.6f},{rank+1}\n")
-    end_time = time.time()
+    # ── KernelSHAP attribution on the trained model — timed ──
+    predict = build_predict_fn(args.task, model, device)
+    rng = np.random.default_rng(args.seed)
 
-    # save SHAP values for downstream plotting
-    np.savez(out_dir / "kernelshap_values.npz", shap_values=shap_values)    
+    bg_n = min(args.background_size, len(data["X_train"]))
+    bg_idx = rng.choice(len(data["X_train"]), size=bg_n, replace=False)
+    # Summarise the background into K centroids to keep KernelSHAP tractable.
+    background = shap.kmeans(data["X_train"][bg_idx].astype(np.float32), args.n_background_clusters)
 
-    # save metadata about computation time
-    with open(out_dir / "metadata.json", "w") as f:
-        json.dump({
-            "model_ckpt": str(args.model_ckpt),
-            "dataset_path": str(args.dataset_path),
-            "ranking_method": "kernelshap",
-            "ranking_results_file": str(out_dir / "ranking.csv"),
-            "raw shap_values_file": str(out_dir / "kernelshap_values.npz"),
-            "computation_time_sec": end_time - start_time,
-        }, f, indent=4)
+    X = data["X_val"].astype(np.float32)
+    if args.explain_size and len(X) > args.explain_size:
+        ex_idx = rng.choice(len(X), size=args.explain_size, replace=False)
+        X = X[ex_idx]
 
-    
+    t1 = time.time()
+    explainer = shap.KernelExplainer(predict, background, link="identity")
+    shap_values = explainer.shap_values(X, nsamples=args.nsamples, silent=False)
+    attribution_time = time.time() - t1
+    ranking_time = time.time() - t0  # INCLUDES one-time model training
+
+    # shap returns [N, d, out] (out=1 for irl/pc, action_dim for bc); some
+    # versions drop the trailing axis for single output → [N, d].
+    arr = np.asarray(shap_values, dtype=np.float64)
+    if arr.ndim == 2:
+        arr = arr[..., None]                     # [N, d] → [N, d, 1]
+    scores = np.mean(np.abs(arr), axis=(0, 2))   # → [d]
+
+    order = sorted(range(n_features), key=lambda i: scores[i], reverse=True)
+    with open(out_dir / "ranking.csv", "w") as fh:
+        fh.write("feature_index,feature_name,score,rank\n")
+        for rank, idx in enumerate(order, start=1):
+            fh.write(f"{idx},{feature_names[idx]},{scores[idx]:.6f},{rank}\n")
+
+    np.savez(out_dir / "kernelshap_values.npz", shap_values=arr)  # [N, d, out]
+
+    save_json({
+        "task": args.task,
+        "ranking_method": "kernelshap",
+        "dataset_path": args.dataset_path,
+        "num_features": n_features,
+        "num_explain_samples": int(len(X)),
+        "background_clusters": int(args.n_background_clusters),
+        "nsamples": args.nsamples,
+        "model_training_time_sec": train_time,
+        "attribution_time_sec": attribution_time,
+        "ranking_time_sec": ranking_time,
+        "test_metrics": test_metrics,
+        "feature_names": feature_names,
+    }, str(out_dir / "metadata.json"))
+
+    print(f"[kernelshap] task={args.task} done. "
+          f"ranking_time={ranking_time:.1f}s "
+          f"(train={train_time:.1f}s + attribution={attribution_time:.1f}s). "
+          f"Saved to {out_dir / 'ranking.csv'}")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="KernelSHAP feature ranking (bc/irl/pc).")
+    p.add_argument("--config", required=True)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--dataset_path", required=True)
+    p.add_argument("--task", required=True, choices=["bc", "irl", "pc"],
+                   help="Which task model to train + attribute.")
+    p.add_argument("--output_dir", required=True)
+    p.add_argument("--background_size", type=int, default=512,
+                   help="Training rows sampled before kmeans summarisation.")
+    p.add_argument("--n_background_clusters", type=int, default=32,
+                   help="KernelSHAP background centroids (shap.kmeans K).")
+    p.add_argument("--explain_size", type=int, default=200,
+                   help="Number of rows to attribute (0 = all val rows).")
+    p.add_argument("--nsamples", default="auto",
+                   help="KernelSHAP coalition samples per row ('auto' or int).")
+    # pc-only knobs consumed by train_and_eval_student.
+    p.add_argument("--fragment_length", type=int, default=50)
+    p.add_argument("--num_pairs", type=int, default=200)
+    p.add_argument("--num_eval_pairs", type=int, default=1000)
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="KernelSHAP feature ranking")
-    parser.add_argument("--model_ckpt", type=str, required=True,
-                        help="Path to model checkpoint (model.pt)")
-    parser.add_argument("--dataset_path", type=str, required=True,
-                        help="Path to dataset.npz with X_train, y_train, feature_names")
-    parser.add_argument("--output_dir", type=str, required=True,
-                        help="Directory to save outputs (ranking.csv, kernelshap_values.npz)")
-    args = parser.parse_args()
+    args = parse_args()
+    if isinstance(args.nsamples, str) and args.nsamples.isdigit():
+        args.nsamples = int(args.nsamples)
     run(args)
